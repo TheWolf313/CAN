@@ -5,6 +5,8 @@ from utils import DropPath
 from clifford_thrust import LayerNorm2d, CliffordInteraction        
 
 
+# Step 1: Define the Geometric Feed-Forward Network (gFFN) module.
+# This module can be plugged into backbone architectures as an alternative to a standard MLP.
 class gFFN(nn.Module):
     """
     Geometric Feed-Forward Network (gFFN)
@@ -21,6 +23,10 @@ class gFFN(nn.Module):
             - 'g': Global only (GlobalAvg context).
             - 'h': Hybrid (Local + Beta * Global).
         shifts (list): Shifts for rolling interaction.
+
+    Notes:
+        - Setting `gffn_mode='h'` introduces a trainable mixing coefficient `beta`.
+        - `enable_cuda` controls whether to use accelerated kernels when available.
     """
     def __init__(self, dim, cli_mode='full', ctx_mode='diff', gffn_mode='h', 
                  shifts=[1, 2, 4], drop_path=0., init_values=1e-5, enable_cuda=False):
@@ -61,6 +67,17 @@ class gFFN(nn.Module):
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()        
         
     def forward(self, x):
+        """Forward pass for the gFFN block.
+
+        Flow:
+          1) Normalize input.
+          2) Compute state and local/global contexts.
+          3) Combine local/global geometric features based on `gffn_mode`.
+          4) Gate and add residual connection.
+
+        Important: When using `gffn_mode='h'`, `beta` controls the balance
+        between local and global features.
+        """
         shortcut = x
         x_ln = self.norm(x) 
         z_state = self.get_state(x_ln)

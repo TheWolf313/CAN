@@ -3,6 +3,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 from utils import DropPath
 
+# Execution flow (high-level):
+# 1) `train.py` is the entry point; it uses helper constructors from `networks.py`.
+# 2) `networks.py` creates `CliffordNet` instances, which are implemented in this file.
+# 3) `CliffordNet` uses blocks defined here (e.g., `CliffordAlgebraBlock`, `GeometricStem`).
+# 4) `utils.py` provides utilities (e.g., seeding and DropPath) used across the model.
+
+# Step 1: Attempt to load accelerated Clifford kernels (CUDA).
+# If these kernels are available, we'll use them for faster execution.
+# If not, we fall back to a pure PyTorch implementation.
 try:
     from clifford_thrust import LayerNorm2d, CliffordInteraction
     print("✅ Successfully loaded accelerated Clifford kernels (CUDA).")
@@ -12,6 +21,15 @@ except ImportError:
     has_acceleration = False
 
 class LayerNorm2d_PyTorch(nn.Module):
+    """Layer normalization over channels for 2D inputs (PyTorch fallback).
+
+    This implementation mimics a channel-wise LayerNorm for 2D feature maps.
+    It is used when the accelerated `LayerNorm2d` kernel is not available.
+
+    Important: This is a pure PyTorch fallback and may be slower than the
+    `clifford_thrust` version.
+    """
+
     def __init__(self, num_channels, eps=1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(num_channels))
@@ -19,6 +37,7 @@ class LayerNorm2d_PyTorch(nn.Module):
         self.eps = eps
 
     def forward(self, x):
+        """Apply layer normalization across channels for 2D feature maps."""
 
         u = x.mean(1, keepdim=True)
         s = (x - u).pow(2).mean(1, keepdim=True)
@@ -27,14 +46,23 @@ class LayerNorm2d_PyTorch(nn.Module):
         return x
     
 class CliffordInteraction_PyTorch(nn.Module):
-    """
+    """Pure PyTorch implementation of Clifford Geometric Interaction.
+
+    This module computes a geometric interaction between two feature maps
+    (`z1` and `z2`) using shift-based operations. It is intended to mirror the
+    behavior of the accelerated `CliffordInteraction` kernel when that kernel
+    is unavailable.
+
     Args:
-        cli_mode: 'full', 'wedge', 'inner'
-        ctx_mode: 
-            - 'diff': C = C_local - H (discrete Laplacian)
-            - 'abs' : C = C_local
-            - 'others': to be added
-    """    
+        cli_mode: Selects interaction type ('full', 'wedge', 'inner').
+        ctx_mode: Context mode: 'diff' uses a discrete Laplacian, 'abs' uses
+            the raw context tensor.
+        shifts: List of channel-wise shifts to apply when computing interactions.
+
+    Note: This is a performance-critical block; prefer the accelerated kernel
+    when available.
+    """
+
     def __init__(self, dim, cli_mode='full', ctx_mode='diff', shifts=[1, 2]):
         super().__init__()
         self.dim = dim
@@ -58,7 +86,12 @@ class CliffordInteraction_PyTorch(nn.Module):
         self.proj_ = nn.Conv2d(cat_dim, dim, kernel_size=1)    
 
     def forward(self, z1, z2):
-        
+        """Compute Clifford geometric interaction between `z1` and `z2`.
+
+        The interaction mixes information via channel shifts and combines
+        local and (optionally) inner/wedge products depending on `cli_mode`.
+        """
+
         if self.ctx_mode == 'diff':
             C = z2 - z1  
         elif self.ctx_mode == 'abs':
@@ -79,6 +112,23 @@ class CliffordInteraction_PyTorch(nn.Module):
         return out  
 
 class CliffordAlgebraBlock(nn.Module):
+    """A single transformer-style block based on Clifford Algebra interactions.
+
+    This block uses a local geometric interaction module (and optionally a
+    global gFFN interaction) to mix features. It is the core building block
+    used in the `CliffordNet` backbone.
+
+    Execution flow:
+      1) Normalize input.
+      2) Extract state and local context.
+      3) Compute geometric interaction features.
+      4) Optionally include global context (gFFNG).
+      5) Gate the fusion and apply residual connection.
+
+    Important: `enable_cuda` toggles between the accelerated kernel and the
+    pure PyTorch fallback.
+    """
+
     def __init__(self, dim, cli_mode='full', ctx_mode = 'diff', shifts=[1, 2], enable_gFFNG=False, num_heads=1, mlp_ratio=0., drop=0., drop_path=0.1, init_values=1e-5, enable_cuda=False):
         super().__init__()
 
@@ -107,6 +157,13 @@ class CliffordAlgebraBlock(nn.Module):
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         
     def forward(self, x):
+        """Forward pass through a single CliffordAlgebraBlock.
+
+        Flow:
+          - Normalize input.
+          - Compute local (and optional global) geometric interactions.
+          - Gate and fuse interactions with residual connection.
+        """
         shortcut = x
         x_ln = self.norm(x) 
         
@@ -127,6 +184,18 @@ class CliffordAlgebraBlock(nn.Module):
         return x    
 
 class GeometricStem(nn.Module):
+    """Initial stem that embeds image patches into a higher-dimensional space.
+
+    This module is responsible for turning the input image into a feature map
+    with `embed_dim` channels. Different `patch_size` values control the degree
+    of spatial downsampling.
+
+    Notes:
+      - patch_size=2 uses a single convolution with stride=2.
+      - patch_size=4 uses two strided convolutions.
+      - Other patch sizes use a single convolution with that stride.
+    """
+
     def __init__(self, in_chans=3, embed_dim=128, patch_size=2):
         super().__init__()
         
@@ -153,11 +222,30 @@ class GeometricStem(nn.Module):
         self.norm = nn.BatchNorm2d(embed_dim) 
 
     def forward(self, x):
+        """Embed input image into patch-based feature map.
+
+        This is the first stage of the network (step 1 in the overall flow).
+        """
         x = self.proj(x)
         x = self.norm(x)
         return x
     
 class CliffordNet(nn.Module):
+    """Main network architecture built using Clifford algebra-inspired blocks.
+
+    The model consists of:
+      1) A geometric stem to embed input images.
+      2) A stack of `CliffordAlgebraBlock` blocks, each performing local/global
+         geometric interactions.
+      3) Global average pooling and a classification head.
+
+    Flow:
+      - `forward_features`: run input through stem + stack of blocks.
+      - `forward`: average spatial dims, normalize, and classify.
+
+    Remember: Changing `depth` or `shifts` can significantly change compute cost.
+    """
+
     def __init__(self, num_classes=10, patch_size=4, embed_dim=128, cli_mode='full', ctx_mode='diff', shifts=[1, 2], depth=6, num_heads=1, mlp_ratio=0., drop_rate=0., drop_path_rate=0.1,enable_cuda=False):
         super().__init__()
         
@@ -182,6 +270,12 @@ class CliffordNet(nn.Module):
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
+        """Initialize module weights with standard defaults.
+
+        Called via `self.apply(self._init_weights)` during model construction.
+
+        Side note: Changing initialization can alter training dynamics severely.
+        """
         if isinstance(m, (nn.Conv2d, nn.Linear)):
             nn.init.trunc_normal_(m.weight, std=.02)
             if m.bias is not None:
@@ -191,6 +285,17 @@ class CliffordNet(nn.Module):
             nn.init.constant_(m.weight, 1.0)
 
     def forward_features(self, x):
+        """Compute features from input through stem and Clifford blocks.
+
+        Flow:
+          - Apply patch embedding stem.
+          - Pass through each CliffordAlgebraBlock in `self.blocks`.
+
+        Returns:
+            A tensor of shape [batch, embed_dim, H', W'] containing features.
+
+        Important: This method does not perform pooling or classification.
+        """
 
         x = self.patch_embed(x) 
         for block in self.blocks:
