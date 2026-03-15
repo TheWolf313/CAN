@@ -1,7 +1,9 @@
 <div align="center">
 
 # CliffordNet: All You Need is Geometric Algebra
-  
+## Repository Structure
+
+![Repo Diagram](./diagram.svg)
 
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
